@@ -190,7 +190,7 @@ export async function buildReadingContext(
     (sum, text) => sum + evidenceTokens(text) + 25,
     evidenceTokens(header) + 30,
   );
-  if (document.kind === "pdf" && fullCost <= tokens)
+  if (document.kind !== "epub" && fullCost <= tokens)
     indexes = context.chunks.map((_, i) => i);
   else
     await buildReaderDocumentContext(document, context, query, false, options, {

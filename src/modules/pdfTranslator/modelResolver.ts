@@ -71,11 +71,13 @@ function normalizeApiBaseUrl(url: string): string {
 const OAUTH_LABEL_TO_PROVIDER: Record<string, OAuthProviderId> = {
   codex: "openai-codex",
   copilot: "github-copilot",
+  kimi: "kimi-code",
 };
 
 const KNOWN_OAUTH_PROVIDERS = new Set<OAuthProviderId>([
   "openai-codex",
   "github-copilot",
+  "kimi-code",
 ]);
 
 function getStringPref(key: string): string {
@@ -143,6 +145,9 @@ function inferProviderFromModelName(modelName: string): OAuthProviderId | null {
     normalized.startsWith("grok-")
   ) {
     return "github-copilot";
+  }
+  if (normalized.startsWith("kimi-") || normalized.startsWith("k3")) {
+    return "kimi-code";
   }
   return null;
 }
@@ -231,6 +236,25 @@ async function resolveOAuthProviderCredentials(
         provider,
         accessToken: credential.accessToken,
         accountId: credential.accountId,
+      },
+    };
+  }
+
+  if (provider === "kimi-code") {
+    // Kimi Code speaks OpenAI chat/completions with the OAuth token as a
+    // Bearer key, so the bridge's generic OpenAI-compatible proxy fits.
+    // Reading the credential refreshes it first when it is past half-life.
+    const pingInfo = await getOAuthProviderPingInfo(provider);
+    if (!pingInfo?.apiBase) return null;
+    return {
+      modelId,
+      apiKey: "aidea-oauth-proxy",
+      apiUrl: "http://127.0.0.1:1/v1",
+      oauthProxy: {
+        provider: "openai-compatible",
+        accessToken: "",
+        apiKey: extractBearerToken(pingInfo.headers || {}),
+        apiBase: normalizeApiBaseUrl(pingInfo.apiBase),
       },
     };
   }

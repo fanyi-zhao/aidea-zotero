@@ -82,6 +82,7 @@ export type SelectionTranslateResult = {
 const KNOWN_OAUTH_PROVIDERS = new Set<string>([
   "openai-codex",
   "github-copilot",
+  "kimi-code",
 ]);
 
 const LANGUAGE_LABELS: Record<string, string> = {

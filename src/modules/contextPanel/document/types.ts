@@ -1,4 +1,4 @@
-export type DocumentKind = "pdf" | "epub";
+export type DocumentKind = "pdf" | "epub" | "html";
 
 export type DocumentCapabilities = {
   selectionText: boolean;

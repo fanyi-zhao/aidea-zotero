@@ -19,6 +19,25 @@ import {
 } from "./reasoningEffort";
 import { recordOAuthEnvUpdateSuccess } from "./oauthEnvUpdateState";
 import {
+  buildKimiChatMessages,
+  buildKimiCodeIdentityHeaders,
+  KimiCodeUnauthorizedError,
+  parseKimiCodeCredentialFile,
+  parseKimiCodeModelsResponse,
+  pollKimiCodeDeviceToken,
+  refreshKimiCodeToken,
+  requestKimiCodeDeviceAuthorization,
+  resolveKimiCodeBaseUrl,
+  resolveKimiCodeCredentialPath,
+  resolveKimiCodeHomeDir,
+  resolveKimiCodeOAuthHost,
+  serializeKimiCodeToken,
+  shouldRefreshKimiCodeToken,
+  type KimiCodeEnv,
+  type KimiCodeToken,
+  type KimiCodeTransport,
+} from "./kimiCodeOAuth";
+import {
   DEFAULT_PANEL_LANG,
   detectPanelLangFromLocale,
   getUiLanguageOption,
@@ -228,7 +247,7 @@ function showCopiedToast(lang: OAuthUiLang): void {
   }
 }
 
-export type OAuthProviderId = "openai-codex" | "github-copilot";
+export type OAuthProviderId = "openai-codex" | "github-copilot" | "kimi-code";
 
 export type OAuthCredential = {
   provider: OAuthProviderId;
@@ -412,6 +431,8 @@ export function markerToProvider(
     return "openai-codex";
   if (raw === providerToMarker("github-copilot") || raw === "github-copilot")
     return "github-copilot";
+  if (raw === providerToMarker("kimi-code") || raw === "kimi-code")
+    return "kimi-code";
   return null;
 }
 
@@ -1506,6 +1527,7 @@ export function getProviderLabel(provider: OAuthProviderId): string {
   if (provider === "openai-codex") return "ChatGPT (Codex OAuth)";
 
   if (provider === "github-copilot") return "GitHub Copilot";
+  if (provider === "kimi-code") return "Kimi Code (OAuth)";
   return provider;
 }
 
@@ -1598,6 +1620,690 @@ async function refreshCodexOAuthCredentialViaCli(): Promise<OAuthCredential | nu
     codexRefreshInFlight = null;
   });
   return codexRefreshInFlight;
+}
+
+// ---------- Kimi Code (Moonshot AI) ----------
+// The plugin speaks the Kimi Code CLI's device-code login itself and keeps
+// the token in the CLI's own credential file, so a login from either side
+// is shared. The CLI itself does not have to be installed.
+
+/** Sent as X-Msh-Version; the service has not been seen to check it. */
+const KIMI_CODE_CLIENT_VERSION = "1.0.0";
+
+function getKimiCodeEnv(): KimiCodeEnv {
+  return {
+    KIMI_CODE_HOME: getEnv("KIMI_CODE_HOME"),
+    KIMI_CODE_OAUTH_HOST: getEnv("KIMI_CODE_OAUTH_HOST"),
+    KIMI_OAUTH_HOST: getEnv("KIMI_OAUTH_HOST"),
+    KIMI_CODE_BASE_URL: getEnv("KIMI_CODE_BASE_URL"),
+  };
+}
+
+function kimiJoin(...parts: string[]): string {
+  return joinPath(...parts);
+}
+
+function kimiCodeCredentialPath(): string {
+  return resolveKimiCodeCredentialPath(getKimiCodeEnv(), homeDir(), kimiJoin);
+}
+
+function readSysInfo(name: string): string {
+  try {
+    const services = (globalThis as any).Services;
+    return String(services?.sysinfo?.getProperty?.(name) || "");
+  } catch {
+    return "";
+  }
+}
+
+function newKimiDeviceId(): string {
+  const cryptoObj = (globalThis as any).crypto;
+  if (typeof cryptoObj?.randomUUID === "function") {
+    return String(cryptoObj.randomUUID()).replace(/-/g, "");
+  }
+  let out = "";
+  for (let i = 0; i < 32; i += 1) {
+    out += Math.floor(Math.random() * 16).toString(16);
+  }
+  return out;
+}
+
+let kimiDeviceIdCache = "";
+
+/** The CLI keeps a device id in its home; reuse it so both look like one device. */
+async function getKimiCodeDeviceId(): Promise<string> {
+  if (kimiDeviceIdCache) return kimiDeviceIdCache;
+  const dir = resolveKimiCodeHomeDir(getKimiCodeEnv(), homeDir(), kimiJoin);
+  const path = dir ? joinPath(dir, "device_id") : "";
+  if (path && pathExists(path)) {
+    try {
+      const text = String(
+        (await Zotero.File.getContentsAsync(path)) || "",
+      ).trim();
+      if (text) {
+        kimiDeviceIdCache = text;
+        return text;
+      }
+    } catch {
+      /* fall through and create one */
+    }
+  }
+  const id = newKimiDeviceId();
+  if (path) {
+    try {
+      await writeTextFilePrivate(path, id);
+    } catch (err) {
+      ztoolkit?.log?.("AIdea: could not save Kimi device id", err);
+    }
+  }
+  kimiDeviceIdCache = id;
+  return id;
+}
+
+async function buildKimiCodeHeaders(): Promise<Record<string, string>> {
+  const platform = currentPlatform();
+  const osName =
+    platform === "windows"
+      ? "Windows"
+      : platform === "macos"
+        ? "macOS"
+        : "Linux";
+  const osVersion = readSysInfo("version");
+  const arch = readSysInfo("arch");
+  const pluginVersion = String(
+    (globalThis as any).addon?.data?.config?.version || "",
+  );
+  return buildKimiCodeIdentityHeaders(
+    {
+      version: KIMI_CODE_CLIENT_VERSION,
+      deviceId: await getKimiCodeDeviceId(),
+      deviceName:
+        getEnv("COMPUTERNAME") || getEnv("HOSTNAME") || readSysInfo("host"),
+      deviceModel: [osName, osVersion, arch].filter(Boolean).join(" "),
+      osVersion,
+    },
+    `AIdea${pluginVersion ? `/${pluginVersion}` : ""}`,
+  );
+}
+
+/** Write a file only the current user can read (the CLI uses 0600/0700). */
+async function writeTextFilePrivate(path: string, text: string): Promise<void> {
+  const io = (globalThis as any).IOUtils;
+  const parent = initLocalFile(path)?.parent?.path || "";
+  if (io?.writeUTF8) {
+    if (parent) {
+      await io.makeDirectory(parent, {
+        createAncestors: true,
+        ignoreExisting: true,
+        permissions: 0o700,
+      });
+    }
+    await io.writeUTF8(path, text, { tmpPath: `${path}.tmp` });
+    if (currentPlatform() !== "windows") {
+      try {
+        await io.setPermissions(path, 0o600);
+      } catch {
+        /* best effort */
+      }
+    }
+    return;
+  }
+  if (parent && !pathExists(parent)) {
+    initLocalFile(parent)?.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+  }
+  await Zotero.File.putContentsAsync(path, text);
+}
+
+async function readKimiCodeToken(): Promise<KimiCodeToken | null> {
+  const path = kimiCodeCredentialPath();
+  if (!path || !pathExists(path)) return null;
+  return parseKimiCodeCredentialFile(await readJsonFile(path));
+}
+
+async function saveKimiCodeToken(token: KimiCodeToken): Promise<void> {
+  const path = kimiCodeCredentialPath();
+  if (!path) throw new Error("Home directory not found");
+  await writeTextFilePrivate(path, serializeKimiCodeToken(token));
+}
+
+function kimiTokenToCredential(token: KimiCodeToken): OAuthCredential {
+  return {
+    provider: "kimi-code",
+    accessToken: token.accessToken,
+    refreshToken: token.refreshToken || undefined,
+    // OAuthCredential.expiresAt is in milliseconds; the file uses seconds.
+    expiresAt: token.expiresAt ? token.expiresAt * 1000 : undefined,
+    sourcePath: kimiCodeCredentialPath(),
+  };
+}
+
+/**
+ * auth.kimi.com refuses connections from Zotero's network stack (Zotero gets
+ * status 0 there, while api.kimi.com and www.kimi.com on the same Cloudflare
+ * addresses answer normally, and curl/Node reach auth.kimi.com fine). Its
+ * requests therefore fall back to the system curl, which ships with Windows
+ * 10+, macOS and Linux. Only these small form posts go this way; chat and
+ * model listing stay on Zotero's own fetch.
+ */
+let kimiAuthViaCurl = false;
+
+function isFetchNetworkFailure(err: unknown): boolean {
+  const name = (err as { name?: unknown })?.name;
+  return (
+    name === "TypeError" ||
+    /NetworkError|Failed to fetch|fetch failed/i.test(String(err))
+  );
+}
+
+function systemCurlPath(): string {
+  if (currentPlatform() === "windows") {
+    const root = getEnv("SystemRoot") || getEnv("windir") || "C:\\Windows";
+    const bundled = joinPath(root, "System32", "curl.exe");
+    return pathExists(bundled) ? bundled : "curl.exe";
+  }
+  for (const candidate of [
+    "/usr/bin/curl",
+    "/bin/curl",
+    "/usr/local/bin/curl",
+  ]) {
+    if (pathExists(candidate)) return candidate;
+  }
+  return "curl";
+}
+
+function kimiTempPath(stem: string): string {
+  const dir =
+    (Zotero as any).getTempDirectory?.()?.path ||
+    Zotero.DataDirectory?.dir ||
+    homeDir();
+  return joinPath(
+    dir,
+    `${stem}-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`,
+  );
+}
+
+/**
+ * A minimal fetch over curl for form posts. The body (device codes, refresh
+ * tokens) goes through a private temp file, never the command line, so other
+ * processes cannot read it from the process list.
+ */
+async function curlFormFetch(url: string, init?: any): Promise<Response> {
+  const bodyPath = kimiTempPath("aidea-kimi-req");
+  const outPath = kimiTempPath("aidea-kimi-res");
+  try {
+    await writeTextFilePrivate(bodyPath, String(init?.body ?? ""));
+    const args = [
+      "-sS",
+      "--max-time",
+      "60",
+      "-X",
+      String(init?.method || "POST"),
+      "-o",
+      outPath,
+      "-w",
+      "%{http_code}",
+    ];
+    for (const [name, value] of Object.entries(
+      (init?.headers || {}) as Record<string, string>,
+    )) {
+      args.push("-H", `${name}: ${value}`);
+    }
+    args.push("--data-binary", `@${bodyPath}`, url);
+    const result = await runShellCommand(
+      buildExecutableCommand(systemCurlPath(), args),
+      { hidden: true, timeoutMs: 90_000 },
+    );
+    const status = Number(
+      String(result.stdout || "")
+        .trim()
+        .slice(-3),
+    );
+    if (result.code !== 0 || !Number.isFinite(status) || status < 100) {
+      throw new Error(
+        `curl request to ${url} failed (exit ${result.code}): ${String(result.stderr || "").trim() || "no output"}`,
+      );
+    }
+    let text = "";
+    try {
+      text = String((await Zotero.File.getContentsAsync(outPath)) || "");
+    } catch {
+      /* empty body */
+    }
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      text: async () => text,
+      json: async () => JSON.parse(text),
+    } as unknown as Response;
+  } finally {
+    removeFileIfExists(bodyPath);
+    removeFileIfExists(outPath);
+  }
+}
+
+async function kimiAuthFetch(url: string, init?: any): Promise<Response> {
+  if (!kimiAuthViaCurl) {
+    try {
+      return await getFetch()(url, init);
+    } catch (err) {
+      if (!isFetchNetworkFailure(err)) throw err;
+      ztoolkit?.log?.(
+        `AIdea: Zotero could not reach ${url}; using the system curl for Kimi sign-in`,
+        err,
+      );
+      kimiAuthViaCurl = true;
+    }
+  }
+  return curlFormFetch(url, init);
+}
+
+let kimiRefreshInFlight: Promise<OAuthCredential | null> | null = null;
+
+/**
+ * Refresh the Kimi Code token and save it where the CLI looks. The file is
+ * re-read first: the CLI may already have refreshed it, and refresh tokens
+ * can rotate, so reusing a stale one would sign both sides out.
+ */
+async function refreshKimiCodeCredential(
+  force = false,
+): Promise<OAuthCredential | null> {
+  if (kimiRefreshInFlight) return kimiRefreshInFlight;
+  kimiRefreshInFlight = (async () => {
+    const current = await readKimiCodeToken();
+    if (!current) return null;
+    const now = Math.floor(Date.now() / 1000);
+    if (!force && !shouldRefreshKimiCodeToken(current, now)) {
+      return kimiTokenToCredential(current);
+    }
+    if (!current.refreshToken) return null;
+    try {
+      const next = await refreshKimiCodeToken({
+        fetch: kimiAuthFetch,
+        oauthHost: resolveKimiCodeOAuthHost(getKimiCodeEnv()),
+        refreshToken: current.refreshToken,
+        identityHeaders: await buildKimiCodeHeaders(),
+        nowSeconds: () => Math.floor(Date.now() / 1000),
+      });
+      if (!next.refreshToken) next.refreshToken = current.refreshToken;
+      await saveKimiCodeToken(next);
+      return kimiTokenToCredential(next);
+    } catch (err) {
+      if (err instanceof KimiCodeUnauthorizedError) {
+        // The CLI may have rotated the token a moment ago.
+        const reread = await readKimiCodeToken();
+        if (reread && reread.refreshToken !== current.refreshToken) {
+          return kimiTokenToCredential(reread);
+        }
+      }
+      ztoolkit?.log?.("AIdea: Kimi Code token refresh failed", err);
+      return null;
+    }
+  })().finally(() => {
+    kimiRefreshInFlight = null;
+  });
+  return kimiRefreshInFlight;
+}
+
+export async function readKimiCodeOAuthCredential(): Promise<OAuthCredential | null> {
+  const token = await readKimiCodeToken();
+  if (!token) return null;
+  if (shouldRefreshKimiCodeToken(token, Math.floor(Date.now() / 1000))) {
+    const refreshed = await refreshKimiCodeCredential();
+    if (refreshed) return refreshed;
+  }
+  return kimiTokenToCredential(token);
+}
+
+type KimiDeviceLoginCopy = {
+  title: string;
+  codeLabel: string;
+  instructions: string;
+  cancelled: string;
+};
+
+const KIMI_DEVICE_LOGIN_COPY_EN: KimiDeviceLoginCopy = {
+  title: "Kimi Code OAuth Login",
+  codeLabel: "Your authorization code",
+  instructions:
+    "Click OK to open the Kimi authorization page in your browser, then sign in and confirm this code.\nThis login is shared with the Kimi Code CLI.",
+  cancelled: "Authorization cancelled by user",
+};
+
+const KIMI_DEVICE_LOGIN_COPY: Partial<
+  Record<OAuthUiLang, KimiDeviceLoginCopy>
+> = {
+  "en-US": KIMI_DEVICE_LOGIN_COPY_EN,
+  "zh-CN": {
+    title: "Kimi Code OAuth 登录",
+    codeLabel: "你的授权码",
+    instructions:
+      "点击“确定”会在浏览器中打开 Kimi 授权页面，请登录并确认此授权码。\n此登录与 Kimi Code CLI 共享。",
+    cancelled: "用户取消了授权",
+  },
+  "zh-TW": {
+    title: "Kimi Code OAuth 登入",
+    codeLabel: "你的授權碼",
+    instructions:
+      "點擊「確定」會在瀏覽器中開啟 Kimi 授權頁面，請登入並確認此授權碼。\n此登入與 Kimi Code CLI 共用。",
+    cancelled: "使用者已取消授權",
+  },
+};
+
+let kimiLoginGeneration = 0;
+
+async function loginKimiCodeDeviceCode(): Promise<{
+  ok: boolean;
+  message: string;
+}> {
+  const generation = ++kimiLoginGeneration;
+  const checkCurrent = () => {
+    if (generation !== kimiLoginGeneration)
+      throw new Error("Kimi Code login cancelled or superseded");
+  };
+  // Names the failing step in the message, so a bare "NetworkError" can be
+  // traced to a request.
+  let step = "preparing the login";
+  try {
+    await ensureZoteroProxyFromSystem({ forceRefresh: true });
+    checkCurrent();
+    const oauthHost = resolveKimiCodeOAuthHost(getKimiCodeEnv());
+    step = "building the device headers";
+    const identityHeaders = await buildKimiCodeHeaders();
+    step = `requesting a login code from ${oauthHost}`;
+    const auth = await requestKimiCodeDeviceAuthorization({
+      fetch: kimiAuthFetch,
+      oauthHost,
+      identityHeaders,
+    });
+    checkCurrent();
+    step = "showing the login code";
+    const lang = getUiLang();
+    const copy = KIMI_DEVICE_LOGIN_COPY[lang] || KIMI_DEVICE_LOGIN_COPY_EN;
+    const win = Zotero.getMainWindow?.();
+    const msg = `${copy.title}\n\n${copy.codeLabel}:\n${auth.userCode || "-"}\n\n${copy.instructions}`;
+    if (!win?.confirm?.(msg)) return { ok: false, message: copy.cancelled };
+    if (auth.userCode) {
+      copyToClipboard(auth.userCode);
+      showCopiedToast(lang);
+    }
+    try {
+      (Zotero as any).launchURL?.(auth.verificationUriComplete);
+    } catch {
+      /* ignore */
+    }
+    step = "waiting for approval in the browser";
+    const token = await pollKimiCodeDeviceToken({
+      fetch: kimiAuthFetch,
+      oauthHost,
+      auth,
+      identityHeaders,
+      nowSeconds: () => Math.floor(Date.now() / 1000),
+      checkCurrent,
+    });
+    step = `saving the login to ${kimiCodeCredentialPath() || "(no home directory)"}`;
+    await saveKimiCodeToken(token);
+    return {
+      ok: true,
+      message: `${getProviderLabel("kimi-code")} OAuth ready`,
+    };
+  } catch (err) {
+    ztoolkit?.log?.(`AIdea: Kimi Code login failed while ${step}`, err);
+    return {
+      ok: false,
+      message: `Kimi login failed while ${step}: ${String(err instanceof Error ? err.message : err)}`,
+    };
+  }
+}
+
+async function fetchKimiCodeAvailableModels(): Promise<ModelListResult> {
+  const cred = await readKimiCodeOAuthCredential();
+  if (!cred) return { models: [], failure: "not-logged-in" };
+  const base = resolveKimiCodeBaseUrl(getKimiCodeEnv());
+  let activeCred = cred;
+  for (;;) {
+    const res = await getFetch()(`${base}/models`, {
+      method: "GET",
+      headers: {
+        ...(await buildKimiCodeHeaders()),
+        Authorization: `Bearer ${activeCred.accessToken}`,
+        Accept: "application/json",
+      },
+    });
+    if (res.ok) {
+      const models = dedupeModels(
+        parseKimiCodeModelsResponse(await res.json()),
+      );
+      return models.length
+        ? { models }
+        : { models: [], failure: "provider", detail: "Empty model list" };
+    }
+    if (res.status === 401 && activeCred === cred) {
+      const refreshed = await refreshKimiCodeCredential(true);
+      if (refreshed && refreshed.accessToken !== cred.accessToken) {
+        activeCred = refreshed;
+        continue;
+      }
+    }
+    return modelListHttpFailure(res.status);
+  }
+}
+
+function kimiTransportForModel(modelId: string): KimiCodeTransport {
+  const wanted = modelId.trim().toLowerCase();
+  const row = getCachedProviderModelOptions("kimi-code").find(
+    (m) => String(m.id || "").toLowerCase() === wanted,
+  );
+  const endpoint = row?.supportedEndpoints?.[0];
+  if (endpoint === "anthropic-messages" || endpoint === "responses") {
+    return endpoint;
+  }
+  return "chat-completions";
+}
+
+/** Ping a Kimi Code model with a tiny request on the transport it speaks. */
+export async function pingKimiCodeModel(
+  modelId: string,
+): Promise<"ok" | "fail"> {
+  const cred = await readKimiCodeOAuthCredential();
+  if (!cred) return "fail";
+  const base = resolveKimiCodeBaseUrl(getKimiCodeEnv());
+  const transport = kimiTransportForModel(modelId);
+  const url =
+    transport === "anthropic-messages"
+      ? `${base}/messages`
+      : transport === "responses"
+        ? `${base}/responses`
+        : `${base}/chat/completions`;
+  const payload =
+    transport === "responses"
+      ? {
+          model: modelId,
+          input: [{ role: "user", content: "hi" }],
+          max_output_tokens: 16,
+          stream: false,
+        }
+      : {
+          model: modelId,
+          messages: [{ role: "user", content: "hi" }],
+          max_tokens: 16,
+          stream: false,
+        };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const res = await getFetch()(url, {
+      method: "POST",
+      headers: {
+        ...(await buildKimiCodeHeaders()),
+        Authorization: `Bearer ${cred.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if ([401, 403, 404, 429].includes(res.status) || res.status >= 500) {
+      return "fail";
+    }
+    if (res.status >= 400) {
+      const text = await res.text().catch(() => "");
+      if (
+        /model.*not.*(found|supported)|does not exist|invalid.*model/i.test(
+          text,
+        )
+      ) {
+        return "fail";
+      }
+    }
+    return "ok";
+  } catch {
+    return "fail";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function chatWithKimiCode(params: {
+  model: string;
+  prompt: string;
+  context?: string;
+  history?: Array<{ role: "user" | "assistant" | "system"; content: any }>;
+  systemPrompt?: string;
+  signal?: AbortSignal;
+  maxTokens?: number;
+  images?: string[];
+  imageGeneration?: boolean;
+  reasoningEffort?: string;
+  onDelta?: (delta: string) => void;
+}): Promise<string> {
+  if (params.imageGeneration) {
+    throw new Error("Kimi Code does not support image generation.");
+  }
+  const cred = await readKimiCodeOAuthCredential();
+  if (!cred?.accessToken) {
+    throw new Error(
+      `${getProviderLabel("kimi-code")} is not logged in. Please complete OAuth login in Settings first.`,
+    );
+  }
+  const base = resolveKimiCodeBaseUrl(getKimiCodeEnv());
+  const transport = kimiTransportForModel(params.model);
+  const hasMaxTokens = hasFiniteNumber(params.maxTokens);
+
+  let url: string;
+  const payload: Record<string, unknown> = {
+    model: params.model,
+    stream: true,
+  };
+  if (transport === "anthropic-messages") {
+    url = `${base}/messages`;
+    payload.messages = buildAnthropicMessagesInput(params);
+    payload.max_tokens = hasMaxTokens ? params.maxTokens : 8192;
+    if (params.systemPrompt?.trim()) {
+      payload.system = params.systemPrompt.trim();
+    }
+  } else if (transport === "responses") {
+    url = `${base}/responses`;
+    payload.input = buildCopilotResponsesInput(params);
+    if (params.systemPrompt?.trim()) {
+      payload.instructions = params.systemPrompt.trim();
+    }
+    if (hasMaxTokens) payload.max_output_tokens = params.maxTokens;
+    if (params.reasoningEffort) {
+      payload.reasoning = { effort: params.reasoningEffort };
+    }
+  } else {
+    url = `${base}/chat/completions`;
+    payload.messages = buildKimiChatMessages({
+      ...params,
+      formattedContext: params.context?.trim()
+        ? formatDocumentContext(params.context)
+        : undefined,
+    });
+    if (hasMaxTokens) payload.max_tokens = params.maxTokens;
+    if (params.reasoningEffort) {
+      payload.reasoning_effort = params.reasoningEffort;
+    }
+  }
+  logOAuthRequestParameterPolicy({
+    provider: "kimi-code",
+    model: params.model,
+    endpointType: `kimi-${transport}`,
+    payload,
+    parameterSource: hasMaxTokens
+      ? "explicit-task"
+      : transport === "anthropic-messages"
+        ? "provider-required-fallback"
+        : "omitted-provider-default",
+  });
+
+  const buildHeaders = async (credential: OAuthCredential) => ({
+    ...(await buildKimiCodeHeaders()),
+    Authorization: `Bearer ${credential.accessToken}`,
+    "Content-Type": "application/json",
+    Accept: "text/event-stream",
+  });
+  let headers = await buildHeaders(cred);
+  const post = () =>
+    fetchWithTransientRetry(
+      getFetch(),
+      url,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        signal: params.signal,
+      },
+      {
+        signal: params.signal,
+        onRetry: ({ attempt, maxAttempts, error }) => {
+          ztoolkit?.log?.(
+            `AIdea: Kimi Code transient upstream error, retry ${attempt}/${maxAttempts - 1}`,
+            error,
+          );
+        },
+      },
+    );
+  let res = await post();
+  if (res.status === 401 && !params.signal?.aborted) {
+    // Expired token: refresh once. Nothing has streamed from a 401.
+    const refreshed = await refreshKimiCodeCredential(true);
+    if (refreshed?.accessToken && refreshed.accessToken !== cred.accessToken) {
+      try {
+        await res.body?.cancel();
+      } catch {
+        /* discarded either way */
+      }
+      headers = await buildHeaders(refreshed);
+      res = await post();
+    }
+  }
+  const hasEffort = "reasoning_effort" in payload || "reasoning" in payload;
+  if (!res.ok && hasEffort) {
+    const errorText = await res.text();
+    if (!isCodexReasoningRejection(res.status, errorText)) {
+      throw new Error(`Kimi Code OAuth HTTP ${res.status}: ${errorText}`);
+    }
+    // A rejected effort must not block the answer: retry on the model default.
+    ztoolkit?.log?.(
+      `AIdea: Kimi Code rejected reasoning effort ${params.reasoningEffort}; retrying with the model default`,
+    );
+    delete payload.reasoning_effort;
+    delete payload.reasoning;
+    res = await post();
+  }
+  if (!res.ok) {
+    throw new Error(`Kimi Code OAuth HTTP ${res.status}: ${await res.text()}`);
+  }
+  const body: ReadableStream<Uint8Array> | string =
+    res.body || (await res.text());
+  if (transport === "anthropic-messages") {
+    return parseAnthropicSSEStream(body, params.onDelta);
+  }
+  if (transport === "responses") {
+    return typeof body === "string"
+      ? parseCodexSSERaw(body, params.onDelta)
+      : parseCodexSSEStream(body, params.onDelta);
+  }
+  return parseOpenAICompatSSEStream(body, params.onDelta);
 }
 
 // ---------- Zotero Prefs helpers for plugin-native OAuth ----------
@@ -2100,6 +2806,7 @@ export async function readProviderOAuthCredential(
   if (provider === "openai-codex") return readCodexOAuthCredential();
 
   if (provider === "github-copilot") return readCopilotOAuthCredential();
+  if (provider === "kimi-code") return readKimiCodeOAuthCredential();
   return null;
 }
 
@@ -2328,6 +3035,7 @@ export async function fetchAvailableModelsDetailed(
   try {
     if (provider === "github-copilot")
       return await fetchCopilotAvailableModels();
+    if (provider === "kimi-code") return await fetchKimiCodeAvailableModels();
     const cred = await readCodexOAuthCredential();
     if (!cred) return { models: [], failure: "not-logged-in" };
 
@@ -2655,6 +3363,9 @@ export function runProviderOAuthLogin(
   if (provider === "github-copilot") {
     return loginCopilotDeviceCode();
   }
+  if (provider === "kimi-code") {
+    return loginKimiCodeDeviceCode();
+  }
   const running = loginInFlight.get(provider);
   if (running) return running;
   const flow = runProviderOAuthLoginOnce(provider).finally(() => {
@@ -2732,7 +3443,9 @@ export async function removeProviderOAuthCredential(
       message: `${getProviderLabel(provider)} authorization removed`,
     };
   }
-  const authPath = codexAuthFilePath();
+  if (provider === "kimi-code") ++kimiLoginGeneration;
+  const authPath =
+    provider === "kimi-code" ? kimiCodeCredentialPath() : codexAuthFilePath();
   if (!authPath) return { ok: false, message: "Home directory not found" };
   const removed = removeFileIfExists(authPath);
   return {
@@ -2926,6 +3639,8 @@ export async function getProviderAccountSummary(
     }
   } else if (provider === "github-copilot") {
     account = "GitHub OAuth";
+  } else if (provider === "kimi-code") {
+    account = "Kimi OAuth";
   } else {
     account = "OAuth";
   }
@@ -3753,6 +4468,10 @@ export async function chatWithProviderOAuth(params: {
     );
   }
 
+  if (params.provider === "kimi-code") {
+    return chatWithKimiCode(params);
+  }
+
   if (params.provider === "openai-codex") {
     // The Codex OAuth token is a ChatGPT session token that works with
     // chatgpt.com/backend-api endpoints (openai-codex-responses API).
@@ -4051,6 +4770,17 @@ export async function getOAuthProviderPingInfo(
       apiBase: "https://chatgpt.com/backend-api",
       headers: {
         ...ensureProviderAuthHeaderInit(cred),
+        "Content-Type": "application/json",
+      },
+    };
+  }
+
+  if (provider === "kimi-code") {
+    return {
+      apiBase: resolveKimiCodeBaseUrl(getKimiCodeEnv()),
+      headers: {
+        ...(await buildKimiCodeHeaders()),
+        Authorization: `Bearer ${cred.accessToken}`,
         "Content-Type": "application/json",
       },
     };
