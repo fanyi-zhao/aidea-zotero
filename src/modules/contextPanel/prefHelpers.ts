@@ -476,6 +476,7 @@ export function getSelectedProfileForItem(itemId: number): {
 const KNOWN_OAUTH_PROVIDERS: ReadonlySet<string> = new Set([
   "openai-codex",
   "github-copilot",
+  "kimi-code",
 ]);
 
 function resolveModelCredentials(

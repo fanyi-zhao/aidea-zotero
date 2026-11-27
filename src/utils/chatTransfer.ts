@@ -331,7 +331,9 @@ export function transferSource(
       ? { kind: "pdf" as const }
       : type === "application/epub+zip"
         ? { kind: "epub" as const }
-        : {}),
+        : type === "text/html" || type === "application/xhtml+xml"
+          ? { kind: "html" as const }
+          : {}),
   };
 }
 async function resolveSource(
@@ -454,7 +456,9 @@ export async function exportChatArchive(
           const ref = originalRefs.find((r: Row) => r.id === citation.id);
           if (
             !ref?.locator ||
-            (citation.source.kind !== "pdf" && citation.source.kind !== "epub")
+            (citation.source.kind !== "pdf" &&
+              citation.source.kind !== "epub" &&
+              citation.source.kind !== "html")
           )
             continue;
           const source = Zotero.Items.get(ref.itemId);

@@ -8,6 +8,10 @@ import {
   epubDocumentAdapter,
   MAX_EPUB_NORMALIZED_TEXT_CHARS,
 } from "../src/modules/contextPanel/document/adapters/epubAdapter";
+import {
+  buildHtmlSnapshotExtraction,
+  htmlSnapshotDocumentAdapter,
+} from "../src/modules/contextPanel/document/adapters/htmlSnapshotAdapter";
 import { pdfDocumentAdapter } from "../src/modules/contextPanel/document/adapters/pdfAdapter";
 import { getDocumentAdapterForItem } from "../src/modules/contextPanel/document/registry";
 import {
@@ -126,14 +130,65 @@ describe("document adapters", function () {
     (globalThis as Record<string, unknown>).ztoolkit = originalZtoolkit;
   });
 
-  it("resolves PDF and EPUB attachments through the adapter registry", function () {
+  it("resolves PDF, EPUB and HTML snapshot attachments through the adapter registry", function () {
     const pdf = makeAttachment(1, "application/pdf", "Paper");
     const epub = makeAttachment(2, "application/epub+zip", "Book");
     const html = makeAttachment(3, "text/html", "Page");
+    const image = makeAttachment(4, "image/png", "Figure");
 
     assert.strictEqual(getDocumentAdapterForItem(pdf), pdfDocumentAdapter);
     assert.strictEqual(getDocumentAdapterForItem(epub), epubDocumentAdapter);
-    assert.isNull(getDocumentAdapterForItem(html));
+    assert.strictEqual(
+      getDocumentAdapterForItem(html),
+      htmlSnapshotDocumentAdapter,
+    );
+    assert.isNull(getDocumentAdapterForItem(image));
+  });
+
+  it("groups HTML snapshot text into heading-scoped sections", function () {
+    const extraction = buildHtmlSnapshotExtraction(
+      [
+        { text: "A04:2025 Cryptographic Failures", headingLevel: 1 },
+        { text: "Background", headingLevel: 2 },
+        { text: "Moving down two positions to #4." },
+        { text: "Weak PRNGs are common." },
+        { text: "How to prevent", headingLevel: 2 },
+        { text: "Classify data processed." },
+      ],
+      "OWASP",
+    );
+
+    assert.strictEqual(extraction.completeness, "complete");
+    const segments = extraction.segments || [];
+    assert.deepEqual(
+      segments.map((segment) => segment.title),
+      ["A04:2025 Cryptographic Failures", "Background", "How to prevent"],
+    );
+    assert.deepEqual(segments[1].headingPath, [
+      "A04:2025 Cryptographic Failures",
+      "Background",
+    ]);
+    assert.include(segments[1].text, "Weak PRNGs are common.");
+    assert.include(extraction.text, "Classify data processed.");
+  });
+
+  it("splits long HTML sections and reports empty pages as unavailable", function () {
+    const long = buildHtmlSnapshotExtraction([
+      { text: "Intro", headingLevel: 2 },
+      ...Array.from({ length: 40 }, (_, i) => ({
+        text: `Paragraph ${i} ${"x".repeat(400)}`,
+      })),
+    ]);
+    const segments = long.segments || [];
+    assert.isAbove(segments.length, 1);
+    for (const segment of segments) {
+      assert.isAtMost(segment.text.length, 6_000);
+      assert.strictEqual(segment.title, "Intro");
+    }
+    assert.strictEqual(
+      buildHtmlSnapshotExtraction([]).completeness,
+      "unavailable",
+    );
   });
 
   it("normalizes relative EPUB references and fragments", function () {

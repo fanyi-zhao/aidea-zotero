@@ -70,7 +70,7 @@ describe("documentContext", function () {
     (globalThis as Record<string, unknown>).ztoolkit = originalZtoolkit;
   });
 
-  it("classifies PDF and EPUB attachment items", function () {
+  it("classifies PDF, EPUB and HTML snapshot attachment items", function () {
     assert.strictEqual(
       getReaderDocumentKind(
         makeAttachment({ id: 1, contentType: PDF_CONTENT_TYPE }),
@@ -83,9 +83,15 @@ describe("documentContext", function () {
       ),
       "epub",
     );
-    assert.isNull(
+    assert.strictEqual(
       getReaderDocumentKind(
         makeAttachment({ id: 3, contentType: "text/html" }),
+      ),
+      "html",
+    );
+    assert.isNull(
+      getReaderDocumentKind(
+        makeAttachment({ id: 4, contentType: "image/png" }),
       ),
     );
   });

@@ -1,10 +1,12 @@
 import { epubDocumentAdapter } from "./adapters/epubAdapter";
+import { htmlSnapshotDocumentAdapter } from "./adapters/htmlSnapshotAdapter";
 import { pdfDocumentAdapter } from "./adapters/pdfAdapter";
 import type { DocumentAdapter, DocumentKind } from "./types";
 
 const adapters: readonly DocumentAdapter[] = [
   pdfDocumentAdapter,
   epubDocumentAdapter,
+  htmlSnapshotDocumentAdapter,
 ];
 
 export function getDocumentAdapters(): readonly DocumentAdapter[] {

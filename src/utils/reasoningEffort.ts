@@ -84,7 +84,7 @@ export function parseCatalogReasoningLevels(
 
 /** Providers whose requests carry a user-selected effort. */
 export function supportsReasoningEffortSelection(providerId: string): boolean {
-  return providerId === "openai-codex";
+  return providerId === "openai-codex" || providerId === "kimi-code";
 }
 
 export function providerIdFromApiBase(apiBase: string | undefined): string {

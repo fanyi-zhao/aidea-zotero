@@ -46,6 +46,7 @@ export type ModelChoice = {
 const OAUTH_PROVIDER_LABELS: Record<OAuthProviderId, string> = {
   "openai-codex": "Codex",
   "github-copilot": "Copilot",
+  "kimi-code": "Kimi",
 };
 
 /**

@@ -588,7 +588,8 @@ describe("custom endpoint settings UI", function () {
 
     assert.equal(customFields.style.display, "none");
     assert.equal((apiBaseInput as any).disabled, true);
-    assert.equal(findTextCount(win.document.body, "OAuth Login"), 2);
+    // Codex, GitHub Copilot and Kimi Code.
+    assert.equal(findTextCount(win.document.body, "OAuth Login"), 3);
 
     (oauthModeRadio as any).checked = false;
     (customModeRadio as any).checked = true;

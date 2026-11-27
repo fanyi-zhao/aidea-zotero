@@ -5946,9 +5946,9 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
             "llm-paper-picker-group-meta",
             {
               textContent: group.attachments.some(
-                (entry) => entry.kind === "epub",
+                (entry) => entry.kind !== "pdf",
               )
-                ? ["pdf", "epub"]
+                ? ["pdf", "epub", "html"]
                     .map((kind) => {
                       const count = group.attachments.filter(
                         (entry) => entry.kind === kind,
@@ -6007,8 +6007,11 @@ export function setupHandlers(body: Element, initialItem?: Zotero.Item | null) {
         );
         const meta = createElement(ownerDoc, "span", "llm-paper-picker-meta", {
           textContent:
-            attachment.kind === "epub"
-              ? i18n.pdfAttachment.replace("PDF", "EPUB")
+            attachment.kind === "epub" || attachment.kind === "html"
+              ? i18n.pdfAttachment.replace(
+                  "PDF",
+                  attachment.kind === "html" ? "HTML" : "EPUB",
+                )
               : i18n.pdfAttachment,
         });
         attachmentMain.append(title, meta);

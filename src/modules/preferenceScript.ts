@@ -11,6 +11,7 @@ import {
   getProviderLabel,
   pingCodexModel,
   pingCopilotModel,
+  pingKimiCodeModel,
   pingModel,
   providerToMarker,
   removeProviderOAuthCredential,
@@ -171,7 +172,11 @@ type PrefKey =
 type Lang = PanelLang;
 const OAUTH_ENV_UPDATE_LOG_EVENT = `${config.addonRef}-oauth-env-update-log`;
 const GITHUB_ISSUES_URL = "https://github.com/Visterainer/aidea-zotero/issues";
-const PROVIDERS: OAuthProviderId[] = ["openai-codex", "github-copilot"];
+const PROVIDERS: OAuthProviderId[] = [
+  "openai-codex",
+  "github-copilot",
+  "kimi-code",
+];
 const PROFILE_KEYS = [
   "Primary",
   "Secondary",
@@ -6352,7 +6357,14 @@ export async function bootstrapSettingTab(
                     pingInfo.headers,
                     m.id,
                   )
-                : await pingModel(pingInfo.apiBase, "", m.id, pingInfo.headers);
+                : provider === "kimi-code"
+                  ? await pingKimiCodeModel(m.id)
+                  : await pingModel(
+                      pingInfo.apiBase,
+                      "",
+                      m.id,
+                      pingInfo.headers,
+                    );
             if (m.status === "ok") okCount++;
             else failCount++;
             renderModels();
@@ -6436,8 +6448,8 @@ export async function bootstrapSettingTab(
       deleteBtn,
     });
 
-    // Copilot uses in-plugin Device Code flow — no CLI needed
-    if (provider === "github-copilot") {
+    // Copilot and Kimi Code use an in-plugin Device Code flow — no CLI needed
+    if (provider === "github-copilot" || provider === "kimi-code") {
       perProviderSetupBtn.remove();
 
       loginBtn.addEventListener("click", async () => {

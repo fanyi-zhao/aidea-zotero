@@ -20,6 +20,7 @@ import { getAuthorProfileLanguage, getStringPref, truncateText } from "./utils";
 const KNOWN_OAUTH_PROVIDERS = new Set<string>([
   "openai-codex",
   "github-copilot",
+  "kimi-code",
 ]);
 
 type AuthorProfileModelConfig = ReturnType<typeof getSelectedProfileForItem>;

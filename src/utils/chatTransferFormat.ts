@@ -5,7 +5,7 @@ export type TransferSource = {
   key: string;
   title: string;
   parentKey?: string;
-  kind?: "pdf" | "epub";
+  kind?: "pdf" | "epub" | "html";
 };
 export type TransferCitation = {
   id: string;
@@ -146,7 +146,9 @@ function source(value: unknown): TransferSource {
     library,
     title: str(r.title, 4000),
     ...(r.parentKey ? { parentKey: str(r.parentKey, 64) } : {}),
-    ...(r.kind === "pdf" || r.kind === "epub" ? { kind: r.kind } : {}),
+    ...(r.kind === "pdf" || r.kind === "epub" || r.kind === "html"
+      ? { kind: r.kind }
+      : {}),
   };
 }
 
